@@ -1,0 +1,207 @@
+import os
+import uuid
+from fastapi import FastAPI, UploadFile, File, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import openai
+from elevenlabs import generate, play, set_api_key
+import json
+import asyncio
+from celery import Celery
+
+# Load environment variables
+load_dotenv()
+
+# Initialize APIs
+openai.api_key = os.getenv("OPENAI_API_KEY")
+elevenlabs_api_key = os.getenv("ELEVENLABS_API_KEY")
+set_api_key(elevenlabs_api_key)
+
+app = FastAPI(title="HailuoAI Clone API")
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Celery for background tasks
+celery_app = Celery(
+    'tasks',
+    broker=os.getenv('REDIS_URL', 'redis://localhost:6379'),
+    backend=os.getenv('REDIS_URL', 'redis://localhost:6379')
+)
+
+# Models
+class ConversationRequest(BaseModel):
+    user_message: str
+    character_id: str
+    conversation_history: list = []
+
+class Character(BaseModel):
+    id: str
+    name: str
+    description: str
+    voice_id: str
+    image_url: str
+    personality_prompt: str
+
+# Sample characters
+SAMPLE_CHARACTERS = {
+    "1": Character(
+        id="1",
+        name="Luna",
+        description="A friendly AI assistant",
+        voice_id="Rachel",  # ElevenLabs voice ID
+        image_url="/assets/luna.png",
+        personality_prompt="You are Luna, a friendly and helpful AI assistant. Keep responses under 2 sentences."
+    ),
+    "2": Character(
+        id="2",
+        name="Kaito",
+        description="A wise mentor",
+        voice_id="Josh",  # ElevenLabs voice ID
+        image_url="/assets/kaito.png",
+        personality_prompt="You are Kaito, a wise and experienced mentor. Provide guidance in 1-2 sentences."
+    )
+}
+
+@celery_app.task
+def generate_ai_response(character_id: str, user_message: str, conversation_history: list):
+    """Background task to generate AI response with video"""
+    try:
+        character = SAMPLE_CHARACTERS[character_id]
+        
+        # Step 1: Generate text response using OpenAI
+        messages = [
+            {"role": "system", "content": character.personality_prompt},
+            *conversation_history,
+            {"role": "user", "content": user_message}
+        ]
+        
+        response = openai.chat.completions.create(
+            model="gpt-4",
+            messages=messages,
+            max_tokens=150
+        )
+        
+        ai_text_response = response.choices[0].message.content
+        
+        # Step 2: Generate audio using ElevenLabs
+        audio = generate(
+            text=ai_text_response,
+            voice=character.voice_id,
+            model="eleven_monolingual_v1"
+        )
+        
+        # Save audio file
+        audio_filename = f"temp_audio_{uuid.uuid4()}.mp3"
+        with open(audio_filename, "wb") as f:
+            f.write(audio)
+        
+        # Step 3: Generate video with lip-sync (simplified - would use Wav2Lip here)
+        video_filename = generate_lip_sync_video(audio_filename, character.image_url)
+        
+        return {
+            "text_response": ai_text_response,
+            "audio_url": f"/audio/{audio_filename}",
+            "video_url": f"/video/{video_filename}",
+            "task_id": generate_ai_response.request.id
+        }
+        
+    except Exception as e:
+        return {"error": str(e)}
+
+def generate_lip_sync_video(audio_path: str, image_path: str) -> str:
+    """
+    Simplified lip-sync generation.
+    In production, you would integrate Wav2Lip here.
+    """
+    # This is a placeholder - actual implementation would require Wav2Lip
+    video_filename = f"temp_video_{uuid.uuid4()}.mp4"
+    
+    # For demo purposes, we'll just return a placeholder
+    # In reality, you'd call your Wav2Lip service here
+    print(f"Would generate lip-sync video for {audio_path} with image {image_path}")
+    
+    return video_filename
+
+# API Routes
+@app.get("/")
+async def root():
+    return {"message": "HailuoAI Clone API"}
+
+@app.get("/characters")
+async def get_characters():
+    return list(SAMPLE_CHARACTERS.values())
+
+@app.post("/conversation")
+async def start_conversation(request: ConversationRequest, background_tasks: BackgroundTasks):
+    """Start a new conversation with a character"""
+    try:
+        # Start background task
+        task = generate_ai_response.delay(
+            request.character_id,
+            request.user_message,
+            request.conversation_history
+        )
+        
+        return {
+            "task_id": task.id,
+            "status": "processing",
+            "message": "Video is being generated..."
+        }
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/task-status/{task_id}")
+async def get_task_status(task_id: str):
+    """Check status of video generation task"""
+    try:
+        task_result = celery_app.AsyncResult(task_id)
+        
+        if task_result.ready():
+            if task_result.successful():
+                return {
+                    "status": "completed",
+                    "result": task_result.result
+                }
+            else:
+                return {
+                    "status": "failed",
+                    "error": str(task_result.result)
+                }
+        else:
+            return {
+                "status": "processing",
+                "message": "Still generating video..."
+            }
+            
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/video/{filename}")
+async def get_video(filename: str):
+    """Serve generated video files"""
+    video_path = f"./{filename}"
+    if os.path.exists(video_path):
+        return FileResponse(video_path, media_type="video/mp4")
+    raise HTTPException(status_code=404, detail="Video not found")
+
+@app.get("/audio/{filename}")
+async def get_audio(filename: str):
+    """Serve generated audio files"""
+    audio_path = f"./{filename}"
+    if os.path.exists(audio_path):
+        return FileResponse(audio_path, media_type="audio/mp3")
+    raise HTTPException(status_code=404, detail="Audio not found")
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
